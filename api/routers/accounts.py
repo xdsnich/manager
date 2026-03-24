@@ -3,7 +3,7 @@ GramGPT API — routers/accounts.py
 Эндпоинты: управление Telegram аккаунтами
 """
 
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -43,14 +43,57 @@ async def get_account(
     return await acc_svc.get_account(db, account_id, current_user.id)
 
 
-@router.post("/", response_model=AccountOut, status_code=201)
+@router.post("/", status_code=201)
 async def create_account(
     data: AccountCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Добавить аккаунт (создаёт запись, авторизация через CLI)"""
-    return await acc_svc.create_account(db, current_user, data.phone)
+    """
+    Регистрирует номер телефона для авторизации.
+    После этого вызови POST /api/v1/tg-auth/send-code чтобы получить SMS-код,
+    затем POST /api/v1/tg-auth/confirm для подтверждения.
+    Весь поток происходит на сайте — терминал не нужен.
+    """
+    phone = data.phone.strip()
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
+    # Проверяем лимит и дублирование
+    await acc_svc.check_limit(db, current_user)
+    existing = await acc_svc.get_account_by_phone(db, phone, current_user.id)
+    if existing:
+        # Возвращаем инструкцию для авторизации
+        return {
+            "account_id": existing.id,
+            "phone": phone,
+            "status": existing.status.value,
+            "already_exists": True,
+            "next_step": "authorize",
+            "instructions": {
+                "step_1": f"POST /api/v1/tg-auth/send-code  body: {{phone: '{phone}'}}",
+                "step_2": "POST /api/v1/tg-auth/confirm     body: {phone, code}",
+                "step_2b": "POST /api/v1/tg-auth/confirm-2fa (если нужен пароль 2FA)",
+            }
+        }
+
+    from models.account import TelegramAccount
+    account = TelegramAccount(user_id=current_user.id, phone=phone)
+    db.add(account)
+    await db.flush()
+
+    return {
+        "account_id": account.id,
+        "phone": phone,
+        "status": "pending_auth",
+        "next_step": "authorize",
+        "instructions": {
+            "step_1": f"POST /api/v1/tg-auth/send-code  body: {{\"phone\": \"{phone}\"}}",
+            "step_2": "POST /api/v1/tg-auth/confirm     body: {\"phone\": \"...\", \"code\": \"12345\"}",
+            "step_2b": "POST /api/v1/tg-auth/confirm-2fa (только если нужен пароль 2FA)",
+        },
+        "note": "Всё происходит через API — терминал не нужен"
+    }
 
 
 @router.patch("/{account_id}", response_model=AccountOut)

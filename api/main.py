@@ -13,17 +13,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import APP_NAME, APP_VERSION, DEBUG, CORS_ORIGINS
 from database import create_tables
 from routers import auth, accounts, proxies, tasks
+from routers import tg_auth, analytics, security, channels, actions
 
 
 # ── Lifespan (старт / стоп) ──────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Старт — создаём таблицы если нет
     await create_tables()
     print(f"✅ {APP_NAME} v{APP_VERSION} запущен")
     print(f"📖 Документация: http://localhost:8000/docs")
     yield
-    # Стоп
     print("👋 API остановлен")
 
 
@@ -48,10 +47,19 @@ app.add_middleware(
 
 
 # ── Роутеры ──────────────────────────────────────────────────
-app.include_router(auth.router,     prefix="/api/v1")
-app.include_router(accounts.router, prefix="/api/v1")
-app.include_router(proxies.router,  prefix="/api/v1")
-app.include_router(tasks.router,    prefix="/api/v1")
+PREFIX = "/api/v1"
+
+app.include_router(auth.router,      prefix=PREFIX)
+app.include_router(accounts.router,  prefix=PREFIX)
+app.include_router(proxies.router,   prefix=PREFIX)
+app.include_router(tasks.router,     prefix=PREFIX)
+
+# Новые роутеры
+app.include_router(tg_auth.router,   prefix=PREFIX)   # Веб-авторизация Telegram
+app.include_router(analytics.router, prefix=PREFIX)   # Dashboard / аналитика
+app.include_router(security.router,  prefix=PREFIX)   # Сессии, 2FA
+app.include_router(channels.router,  prefix=PREFIX)   # Каналы
+app.include_router(actions.router,   prefix=PREFIX)   # Быстрые действия
 
 
 # ── Healthcheck ──────────────────────────────────────────────
@@ -66,13 +74,20 @@ async def root():
         "name":    APP_NAME,
         "version": APP_VERSION,
         "docs":    "/docs",
+        "routes": {
+            "auth":       f"{PREFIX}/auth",
+            "accounts":   f"{PREFIX}/accounts",
+            "proxies":    f"{PREFIX}/proxies",
+            "tasks":      f"{PREFIX}/tasks",
+            "tg_auth":    f"{PREFIX}/tg-auth",      # ← Веб-авторизация TG
+            "analytics":  f"{PREFIX}/analytics",    # ← Dashboard
+            "security":   f"{PREFIX}/security",     # ← Сессии, 2FA
+            "channels":   f"{PREFIX}/channels",     # ← Каналы
+        }
     }
 
 
-# {
-#   "email": "test@test.com",
-#   "password": "password123"
-# }
-#cd api && venv\Scripts\activate
+# Запуск:
+# cd api && venv\Scripts\activate
 # uvicorn main:app --reload --port 8000
 # python -m celery -A celery_app worker -Q high_priority,bulk_actions --loglevel=info -P solo
