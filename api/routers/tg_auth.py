@@ -101,7 +101,7 @@ def _make_client(phone: str):
         cli_config.API_HASH,
         device_model="Desktop",
         system_version="Windows 10",
-        app_version="4.14.15",
+        app_version="5.0.0",
         lang_code="ru",
         system_lang_code="ru",
     )
@@ -118,40 +118,41 @@ def _run(coro):
 
 # ── Endpoints ────────────────────────────────────────────────
 
+ACTIVE_AUTH_CLIENTS = {}
+
+# ── Endpoints ────────────────────────────────────────────────
+
 @router.post("/send-code", response_model=SendCodeResponse)
 async def send_code(
     body: SendCodeRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Шаг 1 — отправить код авторизации на номер телефона.
-    Код придёт в приложение Telegram или по SMS.
-    """
     phone = body.phone.strip()
     if not phone.startswith("+"):
         phone = "+" + phone
 
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
     cli_config = load_cli_config() 
 
     if not cli_config.API_ID or not cli_config.API_HASH:
-        raise HTTPException(
-            status_code=500,
-            detail="TG_API_ID / TG_API_HASH не настроены на сервере"
-        )
+        raise HTTPException(status_code=500, detail="TG_API_ID / TG_API_HASH не настроены на сервере")
+
+    # Если клиент для этого номера уже висит в памяти — очищаем его
+    if phone in ACTIVE_AUTH_CLIENTS:
+        try:
+            await ACTIVE_AUTH_CLIENTS[phone].disconnect()
+        except:
+            pass
+        del ACTIVE_AUTH_CLIENTS[phone]
 
     client = _make_client(phone)
 
     try:
         await client.connect()
 
-        # Если уже авторизован — сразу возвращаем
         if await client.is_user_authorized():
             await client.disconnect()
             return SendCodeResponse(
-                phone=phone,
-                code_type="already_authorized",
+                phone=phone, code_type="already_authorized",
                 message="Аккаунт уже авторизован. Можно добавить без кода."
             )
 
@@ -164,14 +165,10 @@ async def send_code(
         elif "Sms" in code_type_name:
             code_type = "sms"
             msg = f"Код отправлен по SMS на {phone}"
-        elif "Call" in code_type_name:
-            code_type = "call"
-            msg = "Сейчас будет звонок с кодом"
         else:
-            code_type = "unknown"
+            code_type = "call"
             msg = f"Код отправлен (тип: {code_type_name})"
 
-        # Сохраняем phone_code_hash в Redis (TTL 10 минут)
         r = _redis()
         session_data = {
             "phone_code_hash": sent.phone_code_hash,
@@ -179,16 +176,13 @@ async def send_code(
         }
         r.setex(_session_key(current_user.id, phone), 600, json.dumps(session_data))
 
-        await client.disconnect()
+        # САМОЕ ВАЖНОЕ: Сохраняем клиента в память и НЕ отключаемся!
+        ACTIVE_AUTH_CLIENTS[phone] = client
 
         return SendCodeResponse(phone=phone, code_type=code_type, message=msg)
 
     except Exception as e:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
+        await client.disconnect()
         err_msg = str(e)
         if "PHONE_NUMBER_INVALID" in err_msg:
             raise HTTPException(status_code=400, detail="Неверный номер телефона")
@@ -206,76 +200,72 @@ async def confirm_code(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Шаг 2 — подтвердить SMS-код и создать сессию.
-    Если аккаунт защищён 2FA — вернёт needs_2fa=True.
-    """
     phone = body.phone.strip()
     if not phone.startswith("+"):
         phone = "+" + phone
 
     code = body.code.strip().replace(" ", "")
 
-    # Достаём phone_code_hash из Redis
     r = _redis()
     raw = r.get(_session_key(current_user.id, phone))
     if not raw:
-        raise HTTPException(
-            status_code=400,
-            detail="Сессия истекла или код не был запрошен. Запроси код заново."
-        )
+        raise HTTPException(status_code=400, detail="Сессия истекла или код не запрошен.")
 
     session_data = json.loads(raw)
     phone_code_hash = session_data["phone_code_hash"]
 
-    client = _make_client(phone)
-
-    try:
+    # Достаем ТОГО ЖЕ САМОГО клиента, который запрашивал код
+    client = ACTIVE_AUTH_CLIENTS.get(phone)
+    if not client:
+        # Резервный вариант, если сервер успел перезагрузиться
+        client = _make_client(phone)
         await client.connect()
 
+    try:
         from telethon import errors
 
         try:
-            await client.sign_in(
-                phone=phone,
-                code=code,
-                phone_code_hash=phone_code_hash,
-            )
+            await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         except errors.SessionPasswordNeededError:
-            # Нужен пароль 2FA — сохраняем флаг и просим пароль
-            r.setex(
-                _session_key(current_user.id, phone) + ":needs2fa",
-                600,
-                "1"
-            )
-            await client.disconnect()
-            return AuthResult(
-                success=False,
-                phone=phone,
-                needs_2fa=True,
-                message="На аккаунте включена 2FA. Введи пароль."
-            )
+            r.setex(_session_key(current_user.id, phone) + ":needs2fa", 600, "1")
+            
+            # Оставляем клиента в памяти для ввода пароля 2FA
+            ACTIVE_AUTH_CLIENTS[phone] = client 
+            
+            return AuthResult(success=False, phone=phone, needs_2fa=True, message="Нужна 2FA.")
         except errors.PhoneCodeInvalidError:
             raise HTTPException(status_code=400, detail="Неверный код")
         except errors.PhoneCodeExpiredError:
             raise HTTPException(status_code=400, detail="Код истёк — запроси новый")
 
-        # Авторизация успешна — получаем данные
+        # Успех! Получаем данные и ТЕПЕРЬ отключаемся
         me = await client.get_me()
         await client.disconnect()
-
-        # Чистим Redis
+        ACTIVE_AUTH_CLIENTS.pop(phone, None) # Убираем из словаря
         r.delete(_session_key(current_user.id, phone))
 
-        # Сохраняем/обновляем аккаунт в БД
         cli_config = load_cli_config()
+        
+        # --- НАЧАЛО БЛОКА БЕЗОПАСНЫХ ИМПОРТОВ ---
+        import sys, os
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        if root_dir not in sys.path:
+            sys.path.insert(0, root_dir)
+
+        # Временно прячем api/config.py из кэша, чтобы trust.py и db.py загрузили корневой конфиг
+        api_config_cache = sys.modules.pop('config', None)
+
         import trust as trust_module
         from db import make_account_template
+
+        # Возвращаем api/config.py обратно в кэш
+        if api_config_cache:
+            sys.modules['config'] = api_config_cache
+        # --- КОНЕЦ БЛОКА БЕЗОПАСНЫХ ИМПОРТОВ ---
 
         account_dict = make_account_template(phone)
         account_dict["id"] = me.id
         account_dict["first_name"] = me.first_name or ""
-        account_dict["last_name"] = me.last_name or ""
         account_dict["username"] = me.username or ""
         account_dict["has_photo"] = bool(me.photo)
         account_dict["session_file"] = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
@@ -284,22 +274,13 @@ async def confirm_code(
 
         db_account = await sync_from_dict(db, current_user, account_dict)
 
-        return AuthResult(
-            success=True,
-            phone=phone,
-            first_name=me.first_name or "",
-            username=me.username or "",
-            account_id=db_account.id,
-            message=f"Аккаунт {phone} успешно авторизован!"
-        )
+        return AuthResult(success=True, phone=phone, first_name=me.first_name or "", username=me.username or "", account_id=db_account.id, message="Успешно!")
 
     except HTTPException:
         raise
     except Exception as e:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await client.disconnect()
+        ACTIVE_AUTH_CLIENTS.pop(phone, None)
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 
@@ -309,10 +290,6 @@ async def confirm_2fa(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Шаг 3 (если нужен) — ввести пароль 2FA.
-    Вызывается только если /confirm вернул needs_2fa=True.
-    """
     phone = body.phone.strip()
     if not phone.startswith("+"):
         phone = "+" + phone
@@ -320,65 +297,64 @@ async def confirm_2fa(
     r = _redis()
     flag = r.get(_session_key(current_user.id, phone) + ":needs2fa")
     if not flag:
-        raise HTTPException(
-            status_code=400,
-            detail="Нет ожидающей 2FA авторизации для этого номера"
-        )
+        raise HTTPException(status_code=400, detail="Нет ожидающей 2FA.")
 
-    client = _make_client(phone)
-
-    try:
+    # Снова берем открытого клиента из памяти
+    client = ACTIVE_AUTH_CLIENTS.get(phone)
+    if not client:
+        client = _make_client(phone)
         await client.connect()
 
+    try:
         from telethon import errors
         try:
             await client.sign_in(password=body.password)
         except errors.PasswordHashInvalidError:
             raise HTTPException(status_code=400, detail="Неверный пароль 2FA")
-        except errors.FloodWaitError as e:
-            raise HTTPException(status_code=429, detail=f"Flood wait — подожди {e.seconds} сек")
 
         me = await client.get_me()
         await client.disconnect()
-
-        # Чистим Redis
+        ACTIVE_AUTH_CLIENTS.pop(phone, None) # Очищаем
         r.delete(_session_key(current_user.id, phone) + ":needs2fa")
         r.delete(_session_key(current_user.id, phone))
 
         cli_config = load_cli_config()
+        
+        # --- НАЧАЛО БЛОКА БЕЗОПАСНЫХ ИМПОРТОВ ---
+        import sys, os
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        if root_dir not in sys.path:
+            sys.path.insert(0, root_dir)
+
+        # Временно прячем api/config.py из кэша, чтобы trust.py и db.py загрузили корневой конфиг
+        api_config_cache = sys.modules.pop('config', None)
+
         import trust as trust_module
         from db import make_account_template
+
+        # Возвращаем api/config.py обратно в кэш
+        if api_config_cache:
+            sys.modules['config'] = api_config_cache
+        # --- КОНЕЦ БЛОКА БЕЗОПАСНЫХ ИМПОРТОВ ---
 
         account_dict = make_account_template(phone)
         account_dict["id"] = me.id
         account_dict["first_name"] = me.first_name or ""
-        account_dict["last_name"] = me.last_name or ""
         account_dict["username"] = me.username or ""
-        account_dict["has_photo"] = bool(me.photo)
         account_dict["session_file"] = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
         account_dict["status"] = "active"
         account_dict["trust_score"] = trust_module.calculate(account_dict)
 
         db_account = await sync_from_dict(db, current_user, account_dict)
 
-        return AuthResult(
-            success=True,
-            phone=phone,
-            first_name=me.first_name or "",
-            username=me.username or "",
-            account_id=db_account.id,
-            message=f"Аккаунт {phone} авторизован (2FA)!"
-        )
+        return AuthResult(success=True, phone=phone, first_name=me.first_name or "", username=me.username or "", account_id=db_account.id, message="Авторизован (2FA)!")
 
     except HTTPException:
         raise
     except Exception as e:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await client.disconnect()
+        ACTIVE_AUTH_CLIENTS.pop(phone, None)
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
-
 
 @router.post("/add-already-authorized")
 async def add_already_authorized(

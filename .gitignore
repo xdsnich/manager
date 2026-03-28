@@ -13,3 +13,5 @@ logs/
 !data/.gitkeep
 !sessions/.gitkeep
 !logs/.gitkeep
+node_modules/
+gramgpt-web/node_modules/
