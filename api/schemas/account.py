@@ -1,6 +1,5 @@
 """
 GramGPT API — schemas/account.py
-Pydantic схемы для аккаунтов
 """
 
 from datetime import datetime
@@ -22,6 +21,8 @@ class AccountUpdate(BaseModel):
     tags:       Optional[list[str]]   = None
     notes:      Optional[str] = None
     proxy_id:   Optional[int] = None
+    geo:        Optional[str] = None
+    category:   Optional[str] = None
 
 
 class AccountOut(BaseModel):
@@ -43,6 +44,8 @@ class AccountOut(BaseModel):
     notes:           str
     channels:        list
     proxy_id:        Optional[int]
+    geo:             str = ""
+    category:        str = ""
     added_at:        datetime
     last_checked:    Optional[datetime]
     error:           Optional[str]

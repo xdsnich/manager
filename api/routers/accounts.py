@@ -33,6 +33,17 @@ async def list_accounts(current_user: User = Depends(get_current_user), db: Asyn
 async def get_stats(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     return await acc_svc.get_stats(db, current_user.id)
 
+@router.get("/filters")
+async def get_filters(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Уникальные значения гео и категорий для фильтров"""
+    result = await db.execute(
+        select(TelegramAccount.geo, TelegramAccount.category).where(TelegramAccount.user_id == current_user.id)
+    )
+    rows = result.all()
+    geos = sorted(set(r[0] for r in rows if r[0]))
+    categories = sorted(set(r[1] for r in rows if r[1]))
+    return {"geos": geos, "categories": categories}
+
 @router.get("/{account_id}", response_model=AccountOut)
 async def get_account(account_id: int, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     return await acc_svc.get_account(db, account_id, current_user.id)
@@ -493,3 +504,318 @@ async def pin_channel_to_profile(
         try: await client.disconnect()
         except: pass
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+
+# ── Пакетный TData импорт ────────────────────────────────────
+
+TDATA_SESSIONS = {}  # session_id → {tmp_dir, accounts: [{index, phone, name, session_path}]}
+
+
+@router.post("/detect-tdata")
+async def detect_tdata(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Шаг 1: Загрузить ZIP с TData → определить сколько аккаунтов внутри.
+    Возвращает session_id + список аккаунтов для назначения прокси.
+    """
+    import tempfile, shutil, zipfile, uuid
+    from pathlib import Path
+
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Загрузите ZIP архив")
+
+    try:
+        from opentele.td import TDesktop
+        from opentele.api import UseCurrentSession
+    except ImportError:
+        raise HTTPException(status_code=500, detail="opentele не установлен")
+
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    from utils.telegram import get_cli_config
+    cli_config = get_cli_config()
+
+    tmp_dir = tempfile.mkdtemp(prefix="gramgpt_tdata_batch_")
+
+    try:
+        # Распаковываем
+        zip_path = os.path.join(tmp_dir, "upload.zip")
+        content = await file.read()
+        with open(zip_path, "wb") as f:
+            f.write(content)
+
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(tmp_dir)
+
+        print(f"📦 Batch TData: распакован в {tmp_dir}")
+
+        # Ищем все tdata папки (дедупликация)
+        tdata_paths_set = set()
+        for root, dirs, files_list in os.walk(tmp_dir):
+            if any(f.startswith("key_") for f in files_list):
+                tdata_paths_set.add(os.path.normpath(root))
+            if "tdata" in dirs:
+                candidate = os.path.normpath(os.path.join(root, "tdata"))
+                tdata_paths_set.add(candidate)
+
+        # Убираем вложенные (если /a/tdata и /a/tdata оба найдены)
+        tdata_paths = sorted(tdata_paths_set)
+
+        if not tdata_paths:
+            raise HTTPException(status_code=400, detail="TData папки не найдены в архиве")
+
+        print(f"📦 Найдено TData папок: {len(tdata_paths)}")
+
+        # Конвертируем каждую в .session
+        detected = []
+        seen_phones = set()
+        for i, tdata_path in enumerate(tdata_paths):
+            try:
+                tdesk = TDesktop(tdata_path)
+                if not tdesk.isLoaded():
+                    print(f"📦 [{i}] TData не загружена: {tdata_path}")
+                    continue
+
+                for acc_idx in range(tdesk.accountsCount):
+                    account_td = tdesk.accounts[acc_idx]
+                    sess_name = f"tdata_acc_{i}_{acc_idx}"
+                    sess_path = os.path.join(tmp_dir, sess_name)
+
+                    from opentele.tl import TelegramClient as OpenteleClient
+                    client = await account_td.ToTelethon(
+                        session=sess_path,
+                        flag=UseCurrentSession,
+                        api_id=cli_config.API_ID,
+                        api_hash=cli_config.API_HASH,
+                    )
+
+                    # Быстро проверяем — авторизован ли
+                    phone = ""
+                    name = ""
+                    username = ""
+                    try:
+                        await client.connect()
+                        if await client.is_user_authorized():
+                            me = await client.get_me()
+                            phone = f"+{me.phone}" if me.phone else ""
+                            name = me.first_name or ""
+                            username = me.username or ""
+                        await client.disconnect()
+                    except:
+                        try: await client.disconnect()
+                        except: pass
+
+                    import asyncio as _aio
+                    await _aio.sleep(0.3)
+
+                    # Дедупликация по телефону
+                    if phone and phone in seen_phones:
+                        print(f"📦 [{phone}] Дубликат — пропускаю")
+                        continue
+                    if phone:
+                        seen_phones.add(phone)
+
+                    detected.append({
+                        "index": len(detected),
+                        "phone": phone,
+                        "name": name,
+                        "username": username,
+                        "session_path": sess_path + ".session",
+                        "tdata_folder": tdata_path,
+                    })
+                    print(f"📦 [{len(detected)}] Найден: {phone} ({name})")
+
+            except Exception as e:
+                print(f"📦 Ошибка обработки TData {tdata_path}: {e}")
+
+        if not detected:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail="Не удалось извлечь аккаунты из TData")
+
+        # Сохраняем в памяти
+        session_id = str(uuid.uuid4())[:8]
+        TDATA_SESSIONS[session_id] = {"tmp_dir": tmp_dir, "accounts": detected}
+
+        print(f"📦 Session ID: {session_id}, аккаунтов: {len(detected)}")
+
+        return {
+            "session_id": session_id,
+            "accounts": [{"index": a["index"], "phone": a["phone"], "name": a["name"],
+                          "username": a["username"]} for a in detected],
+            "total": len(detected),
+        }
+
+    except HTTPException: raise
+    except Exception as e:
+        try: shutil.rmtree(tmp_dir, ignore_errors=True)
+        except: pass
+        print(f"📦 ❌ Ошибка detect: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+
+class TDataAccountImport(BaseModel):
+    index: int
+    proxy_string: str = ""  # "ip:port:login:password" или пусто
+    proxy_id: int | None = None
+
+
+class TDataBatchImportRequest(BaseModel):
+    session_id: str
+    accounts: list[TDataAccountImport]
+
+
+@router.post("/import-tdata-batch")
+async def import_tdata_batch(
+    body: TDataBatchImportRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Шаг 2: Импортировать аккаунты с назначенными прокси.
+    Для каждого аккаунта: подключается через прокси, сохраняет в БД.
+    Если proxy_string — создаёт новый прокси в БД.
+    """
+    import shutil
+    from pathlib import Path
+
+    session_data = TDATA_SESSIONS.get(body.session_id)
+    if not session_data:
+        raise HTTPException(status_code=400, detail="Сессия не найдена или истекла")
+
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    from utils.telegram import get_cli_config, _build_proxy
+    cli_config = get_cli_config()
+
+    results = []
+
+    for item in body.accounts:
+        acc_data = next((a for a in session_data["accounts"] if a["index"] == item.index), None)
+        if not acc_data:
+            results.append({"index": item.index, "success": False, "error": "Аккаунт не найден"})
+            continue
+
+        phone = acc_data["phone"]
+        session_path = acc_data["session_path"]
+
+        if not phone:
+            results.append({"index": item.index, "success": False, "error": "Не удалось определить телефон"})
+            continue
+
+        try:
+            # Определяем прокси
+            proxy_id = item.proxy_id
+            proxy_dict = None
+
+            # Если передана строка прокси — парсим и создаём в БД
+            if item.proxy_string and not proxy_id:
+                parts = item.proxy_string.strip().split(":")
+                if len(parts) >= 2:
+                    from models.proxy import Proxy as ProxyModel
+                    host = parts[0]
+                    port = int(parts[1])
+                    login = parts[2] if len(parts) > 2 else ""
+                    password = parts[3] if len(parts) > 3 else ""
+
+                    # Проверяем нет ли уже такого
+                    existing_p = await db.execute(
+                        select(Proxy).where(Proxy.host == host, Proxy.port == port, Proxy.user_id == current_user.id)
+                    )
+                    proxy_row = existing_p.scalar_one_or_none()
+
+                    if not proxy_row:
+                        proxy_row = Proxy(user_id=current_user.id, host=host, port=port,
+                                          login=login, password=password, protocol="socks5")
+                        db.add(proxy_row)
+                        await db.flush()
+                        print(f"📦 Создан прокси: {host}:{port}")
+
+                    proxy_id = proxy_row.id
+                    proxy_dict = _build_proxy(proxy_row)
+
+            elif proxy_id:
+                proxy_r = await db.execute(select(Proxy).where(Proxy.id == proxy_id))
+                proxy_row = proxy_r.scalar_one_or_none()
+                if proxy_row:
+                    proxy_dict = _build_proxy(proxy_row)
+
+            # Копируем session в sessions/
+            final_session = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
+            shutil.copy2(session_path, final_session)
+
+            # Подключаемся через прокси
+            from telethon import TelegramClient as TelethonClient
+            sess = final_session.replace(".session", "")
+            client = TelethonClient(
+                sess, cli_config.API_ID, cli_config.API_HASH,
+                proxy=proxy_dict,
+                device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
+                lang_code="ru", system_lang_code="ru", timeout=30,
+            )
+
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                results.append({"index": item.index, "phone": phone, "success": False, "error": "Сессия не авторизована"})
+                continue
+
+            me = await client.get_me()
+
+            # Загружаем bio
+            bio = ""
+            try:
+                from telethon.tl.functions.users import GetFullUserRequest
+                full = await client(GetFullUserRequest(me))
+                bio = full.full_user.about or ""
+            except:
+                pass
+
+            await client.disconnect()
+
+            # Сохраняем в БД
+            existing = await acc_svc.get_account_by_phone(db, phone, current_user.id)
+            if existing:
+                existing.session_file = final_session
+                existing.status = "active"
+                existing.first_name = me.first_name or ""
+                existing.last_name = me.last_name or ""
+                existing.username = me.username or ""
+                existing.bio = bio
+                existing.has_photo = bool(me.photo)
+                existing.tg_id = me.id
+                existing.proxy_id = proxy_id  # Всегда назначаем (даже None)
+                await db.flush()
+                results.append({"index": item.index, "phone": phone, "success": True,
+                                "account_id": existing.id, "name": me.first_name or ""})
+            else:
+                account = TelegramAccount(
+                    user_id=current_user.id, phone=phone, session_file=final_session,
+                    status="active", first_name=me.first_name or "", last_name=me.last_name or "",
+                    username=me.username or "", bio=bio, has_photo=bool(me.photo), tg_id=me.id,
+                    proxy_id=proxy_id,
+                )
+                db.add(account)
+                await db.flush()
+                results.append({"index": item.index, "phone": phone, "success": True,
+                                "account_id": account.id, "name": me.first_name or ""})
+
+            print(f"📦 ✅ {phone} импортирован")
+
+        except Exception as e:
+            print(f"📦 ❌ {phone}: {e}")
+            results.append({"index": item.index, "phone": phone, "success": False, "error": str(e)[:200]})
+
+    # Очищаем temp
+    try: shutil.rmtree(session_data["tmp_dir"], ignore_errors=True)
+    except: pass
+    TDATA_SESSIONS.pop(body.session_id, None)
+
+    success = sum(1 for r in results if r.get("success"))
+    print(f"📦 Batch импорт: {success}/{len(results)} успешно")
+
+    return {"total": len(results), "success": success, "results": results}

@@ -54,16 +54,16 @@ class TelegramAccount(Base):
     tags:             Mapped[list]                 = mapped_column(JSON, default=list)
     notes:            Mapped[str]                  = mapped_column(Text, default="")
     channels:         Mapped[list]                 = mapped_column(JSON, default=list)
-    quarantine_reason:Mapped[Optional[str]]        = mapped_column(String(255), nullable=True)
-    quarantine_at:    Mapped[Optional[datetime]]   = mapped_column(DateTime, nullable=True)
-    proxy_id:         Mapped[Optional[int]]        = mapped_column(ForeignKey("proxies.id"), nullable=True)
+    proxy_id:         Mapped[Optional[int]]        = mapped_column(ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True)
+    geo:              Mapped[str]                  = mapped_column(String(64), default="", server_default="")
+    category:         Mapped[str]                  = mapped_column(String(128), default="", server_default="")
     added_at:         Mapped[datetime]             = mapped_column(DateTime, default=datetime.utcnow)
-    last_checked:     Mapped[Optional[datetime]]   = mapped_column(DateTime, nullable=True)
     updated_at:       Mapped[datetime]             = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    error:            Mapped[Optional[str]]        = mapped_column(Text, nullable=True)
+    last_checked:     Mapped[Optional[datetime]]   = mapped_column(DateTime, nullable=True)
+    error:            Mapped[Optional[str]]        = mapped_column(String(512), nullable=True)
 
-    user:  Mapped[User]           = relationship("User", back_populates="accounts")
+    user:  Mapped[User]  = relationship("User", back_populates="accounts")
     proxy: Mapped[Optional[Proxy]] = relationship("Proxy", back_populates="accounts")
 
     def __repr__(self):
-        return f"<Account {self.phone} [{self.status}] trust={self.trust_score}>"
+        return f"<Account {self.phone} [{self.status}]>"

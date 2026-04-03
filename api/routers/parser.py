@@ -352,3 +352,86 @@ async def import_channels(
 
     await db.flush()
     return {"added": added}
+
+
+# ── Папки каналов ────────────────────────────────────────────
+
+@router.get("/folders")
+async def list_folders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Уникальные папки + количество каналов в каждой"""
+    result = await db.execute(
+        select(ParsedChannel.folder).where(
+            ParsedChannel.user_id == current_user.id,
+            ParsedChannel.folder != "",
+        )
+    )
+    folders_raw = [r[0] for r in result.all()]
+    folder_counts = {}
+    for f in folders_raw:
+        folder_counts[f] = folder_counts.get(f, 0) + 1
+    return [{"name": k, "count": v} for k, v in sorted(folder_counts.items())]
+
+
+@router.get("/folders/{folder_name}/channels")
+async def get_folder_channels(
+    folder_name: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Каналы в конкретной папке"""
+    result = await db.execute(
+        select(ParsedChannel).where(
+            ParsedChannel.user_id == current_user.id,
+            ParsedChannel.folder == folder_name,
+        )
+    )
+    channels = result.scalars().all()
+    return [{"id": c.id, "username": c.username, "title": c.title,
+             "subscribers": c.subscribers, "has_comments": c.has_comments} for c in channels]
+
+
+class SetFolderRequest(BaseModel):
+    channel_ids: list[int]
+    folder: str
+
+
+@router.post("/set-folder")
+async def set_folder(
+    body: SetFolderRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Назначить папку нескольким каналам"""
+    result = await db.execute(
+        select(ParsedChannel).where(
+            ParsedChannel.user_id == current_user.id,
+            ParsedChannel.id.in_(body.channel_ids),
+        )
+    )
+    channels = result.scalars().all()
+    for ch in channels:
+        ch.folder = body.folder
+    await db.flush()
+    return {"updated": len(channels), "folder": body.folder}
+
+
+@router.patch("/channels/{channel_id}/folder")
+async def update_channel_folder(
+    channel_id: int,
+    body: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Изменить папку одного канала"""
+    result = await db.execute(
+        select(ParsedChannel).where(ParsedChannel.id == channel_id, ParsedChannel.user_id == current_user.id)
+    )
+    ch = result.scalar_one_or_none()
+    if not ch:
+        raise HTTPException(status_code=404, detail="Канал не найден")
+    ch.folder = body.get("folder", "")
+    await db.flush()
+    return {"id": ch.id, "folder": ch.folder}
