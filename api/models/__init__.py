@@ -9,11 +9,12 @@ from .warmup import WarmupTask
 from .parsed_channel import ParsedChannel
 from .reaction import ReactionTask
 from .warmup_log import WarmupLog
+from .subscribe_task import SubscribeTask
 __all__ = [
     "User", "RefreshToken", "PlanEnum",
     "TelegramAccount", "AccountStatus", "AccountRole",
     "Proxy", "ProxyProtocol","ApiApp",
     "AIDialog", "ActionLog",
     "Campaign", "TargetChannel", "CampaignStatus", "TriggerMode", "LLMProvider", "CommentTone",
-    "WarmupTask", "ParsedChannel","ReactionTask","WarmupLog"
+    "WarmupTask", "ParsedChannel","ReactionTask","WarmupLog","SubscribeTask",
 ]

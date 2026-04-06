@@ -52,7 +52,13 @@ ACTION_LABELS = {
     "search":        "🔍 Поиск",
     "join_channel":  "📢 Вступление",
     "forward_saved": "💾 Пересылка",
+    "session_start": "▶ Начало сессии",
+    "session_end":   "⏹ Конец сессии",
+    "rest_day":      "😴 День отдыха",
+    "finished":      "✅ Завершён",
     "error":         "❌ Ошибка",
+    "send_saved":    "💬 Сообщение в Saved",
+    "reply_dm":      "↩️ Ответ на ЛС",
 }
 
 
@@ -74,7 +80,7 @@ def _task_to_dict(t: WarmupTask, logs_count: int = 0) -> dict:
         "stories_viewed": t.stories_viewed,
         "reactions_set": t.reactions_set,
         "channels_joined": t.channels_joined,
-        "next_action_at": t.next_action_at.isoformat() if getattr(t, 'next_action_at', None) else None,
+        "next_action_at": (t.next_action_at.isoformat() + "Z") if getattr(t, 'next_action_at', None) else None,
         "start_offset_min": getattr(t, 'start_offset_min', 0) or 0,
         "mode_config": MODE_CONFIG.get(t.mode, MODE_CONFIG["normal"]),
         "logs_count": logs_count,
@@ -207,10 +213,8 @@ async def start_warmup(
     t.today_actions = 0
 
     # Случайный лимит для первого дня
-    from tasks.warmup_v2 import get_day_limit
-    min_a, max_a = get_day_limit(1)
-    mult = MODE_CONFIG.get(t.mode, {}).get("day_mult", 1.0)
-    t.today_limit = int(random.randint(min_a, max_a) * mult)
+    day_mult = {"careful": 0.6, "normal": 1.0, "aggressive": 1.4}.get(t.mode, 1.0)
+    t.today_limit = int(random.randint(25, 50) * 0.4 * day_mult)
 
     # Offset — первое действие не сразу
     offset = getattr(t, 'start_offset_min', 0) or 0
@@ -258,6 +262,24 @@ async def start_all_warmups(
 
     await db.flush()
     return {"started": started, "message": f"Запущено {started} задач"}
+
+
+@router.post("/tasks/{task_id}/pause")
+async def pause_warmup(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WarmupTask).where(WarmupTask.id == task_id, WarmupTask.user_id == current_user.id)
+    )
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    t.status = "paused"
+    await db.flush()
+    return {"success": True, "status": "paused"}
 
 
 @router.post("/tasks/{task_id}/stop")

@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import APP_NAME, APP_VERSION, DEBUG, CORS_ORIGINS
 from database import create_tables
 from routers import auth, accounts, proxies, tasks
-from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser, api_apps, reactions
+from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser, api_apps, reactions, subscribe
 
 # ── Lifespan (старт / стоп) ──────────────────────────────────
 @asynccontextmanager
@@ -66,7 +66,7 @@ app.include_router(warmup.router,    prefix=PREFIX)  # Прогрев аккау
 app.include_router(parser.router,    prefix=PREFIX)  # Парсер каналов
 app.include_router(api_apps.router, prefix=PREFIX)  # Мульти-API ключи
 app.include_router(reactions.router, prefix=PREFIX)  # Реакции
-
+app.include_router(subscribe.router, prefix=PREFIX)
 
 # ── Healthcheck ──────────────────────────────────────────────
 @app.get("/health")

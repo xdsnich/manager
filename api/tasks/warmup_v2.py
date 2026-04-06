@@ -1,14 +1,14 @@
 """
 GramGPT API — tasks/warmup_v2.py
-Прогрев аккаунтов v2 — имитация живого человека.
+Прогрев аккаунтов v2 — модель сессий живого человека.
 
-Принципы:
-  - Активность 8:00–23:00, ночью спим
-  - Градация: день 1 = 2-5 действий, день 7 = 15-25
-  - Случайный порядок действий с весами
-  - Паузы 30с–15мин между действиями
-  - 15% шанс дня отдыха
-  - Разное время старта для каждого аккаунта
+Вместо "одно действие каждые N минут" — сессии:
+  - Утренняя проверка (8–10): 5-10 действий за 5 мин
+  - Мини-проверки (10–18): 1-3 действия за 30с, каждые 2ч
+  - Обеденный залип (12–14): 8-15 действий за 10 мин
+  - Вечерний сёрфинг (19–23): 10-25 действий за 20 мин
+
+Между сессиями — тишина (часы). Как реальный человек.
 """
 
 import asyncio
@@ -23,7 +23,8 @@ from celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if API_DIR not in sys.path:
+    sys.path.insert(0, API_DIR)
 
 
 def run_async(coro):
@@ -35,17 +36,34 @@ def run_async(coro):
         loop.close()
 
 
-# ── Конфигурация ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# КОНФИГУРАЦИЯ
+# ═══════════════════════════════════════════════════════════
 
 ACTIONS = [
-    {"name": "read_feed",      "weight": 30, "label": "📖 Чтение ленты"},
-    {"name": "set_reaction",   "weight": 20, "label": "😍 Реакция"},
-    {"name": "view_stories",   "weight": 15, "label": "👁 Просмотр Stories"},
-    {"name": "view_profile",   "weight": 10, "label": "👤 Просмотр профиля"},
-    {"name": "typing",         "weight": 10, "label": "⌨️ Печатает"},
+    {"name": "read_feed",      "weight": 25, "label": "📖 Чтение ленты"},
+    {"name": "set_reaction",   "weight": 18, "label": "😍 Реакция"},
+    {"name": "view_stories",   "weight": 12, "label": "👁 Просмотр Stories"},
+    {"name": "view_profile",   "weight": 8,  "label": "👤 Просмотр профиля"},
+    {"name": "typing",         "weight": 5,  "label": "⌨️ Печатает"},
     {"name": "search",         "weight": 5,  "label": "🔍 Поиск"},
-    {"name": "join_channel",   "weight": 5,  "label": "📢 Вступление в канал"},
+    {"name": "join_channel",   "weight": 4,  "label": "📢 Вступление в канал"},
     {"name": "forward_saved",  "weight": 5,  "label": "💾 Пересылка в Saved"},
+    {"name": "send_saved",     "weight": 10, "label": "💬 Сообщение в Saved"},
+    {"name": "reply_dm",       "weight": 8,  "label": "↩️ Ответ на ЛС"},
+]
+
+SAVED_MESSAGES = [
+    "ок", "👍", "✅", "нагадати", "перевірити", "зробити",
+    "купити", "📌", "🔖", "!", "...", "++", "потім",
+    "завтра", "важливо", "прочитати", "📎", "💡", "не забути",
+    "ссылка", "todo", "check", "done", "⭐",
+]
+
+REPLY_MESSAGES = [
+    "👍", "ок", "окк", "добре", "зрозумів", "дякую", "спс",
+    "👌", "✅", "🤝", "ага", "да", "принял", "буду",
+    "хорошо", "лан", "ладно", "+", ")", "🙏",
 ]
 
 REACTION_EMOJIS = ["👍", "🔥", "❤️", "😁", "🎉", "🤩", "👏", "💯", "😍", "🤔"]
@@ -60,25 +78,100 @@ SEARCH_WORDS = [
     "спорт", "технологии", "бизнес", "путешествия", "кот", "мемы",
 ]
 
-# Лимиты по дням (day → (min_actions, max_actions))
-DAY_LIMITS = {
-    1: (2, 5),
-    2: (3, 7),
-    3: (5, 10),
-    4: (7, 14),
-    5: (10, 18),
-    6: (12, 22),
-    7: (15, 25),
+REST_CHANCE = 0.15  # 15% шанс дня отдыха
+
+# ── Сессии — расписание "живого" человека ────────────────────
+
+# ── Базовые сессии — время будет сдвигаться рандомно ─────────
+
+SESSIONS = [
+    {
+        "name": "morning",
+        "label": "🌅 Утренняя проверка",
+        "hour_start": 8, "hour_end": 10,
+        "actions_min": 5, "actions_max": 10,
+        "delay_min": 10, "delay_max": 30,
+        "chance": 0.70,          # 30% шанс пропустить
+        "shift_range": (-60, 90),  # сдвиг ±60-90 минут
+    },
+    {
+        "name": "mini_1",
+        "label": "📱 Мини-проверка",
+        "hour_start": 10, "hour_end": 12,
+        "actions_min": 1, "actions_max": 3,
+        "delay_min": 5, "delay_max": 15,
+        "chance": 0.50,
+        "shift_range": (-30, 60),
+    },
+    {
+        "name": "lunch",
+        "label": "🍔 Обеденный залип",
+        "hour_start": 12, "hour_end": 14,
+        "actions_min": 8, "actions_max": 15,
+        "delay_min": 15, "delay_max": 45,
+        "chance": 0.65,
+        "shift_range": (-45, 75),
+    },
+    {
+        "name": "mini_2",
+        "label": "📱 Мини-проверка",
+        "hour_start": 14, "hour_end": 16,
+        "actions_min": 1, "actions_max": 3,
+        "delay_min": 5, "delay_max": 15,
+        "chance": 0.40,
+        "shift_range": (-30, 60),
+    },
+    {
+        "name": "mini_3",
+        "label": "📱 Мини-проверка",
+        "hour_start": 16, "hour_end": 19,
+        "actions_min": 2, "actions_max": 5,
+        "delay_min": 10, "delay_max": 30,
+        "chance": 0.50,
+        "shift_range": (-45, 60),
+    },
+    {
+        "name": "evening",
+        "label": "🌙 Вечерний сёрфинг",
+        "hour_start": 19, "hour_end": 24,
+        "actions_min": 10, "actions_max": 25,
+        "delay_min": 10, "delay_max": 60,
+        "chance": 0.80,          # 20% шанс пропустить вечер
+        "shift_range": (-60, 60),
+    },
+]
+
+# Типы дней — не каждый день одинаковый
+DAY_TYPES = [
+    {"name": "normal",   "weight": 40, "session_mult": 1.0, "label": "Обычный день"},
+    {"name": "active",   "weight": 20, "session_mult": 1.3, "label": "Активный день"},
+    {"name": "lazy",     "weight": 20, "session_mult": 0.5, "label": "Ленивый день — только 1-2 захода"},
+    {"name": "random",   "weight": 15, "session_mult": 0.8, "label": "Хаотичный день — рандомные часы"},
+    {"name": "rest",     "weight": 5,  "session_mult": 0.0, "label": "День отдыха — не заходит"},
+]
+
+DAY_MULTIPLIER = {
+    1: 0.4,
+    2: 0.55,
+    3: 0.7,
+    4: 0.8,
+    5: 0.9,
+    6: 1.0,
+    7: 1.0,
 }
 
-REST_CHANCE = 0.15  # 15% шанс дня отдыха
-ACTIVE_HOURS = (8, 23)  # Активность с 8 до 23
+MODE_MULTIPLIER = {
+    "careful": 0.6,
+    "normal": 1.0,
+    "aggressive": 1.4,
+}
 
 
-# ── Выбор действия ───────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# ВЫБОР ДЕЙСТВИЯ
+# ═══════════════════════════════════════════════════════════
 
 def pick_action() -> dict:
-    """Выбирает случайное действие с учётом весов."""
     total = sum(a["weight"] for a in ACTIONS)
     r = random.randint(1, total)
     cumulative = 0
@@ -89,30 +182,45 @@ def pick_action() -> dict:
     return ACTIONS[0]
 
 
-def get_day_limit(day: int) -> tuple:
-    """Лимит действий для конкретного дня."""
-    if day in DAY_LIMITS:
-        return DAY_LIMITS[day]
-    return (15, 25)  # после 7го дня — стабильно
+def pick_day_type() -> dict:
+    """Выбирает тип дня с учётом весов."""
+    total = sum(d["weight"] for d in DAY_TYPES)
+    r = random.randint(1, total)
+    cumulative = 0
+    for dt in DAY_TYPES:
+        cumulative += dt["weight"]
+        if r <= cumulative:
+            return dt
+    return DAY_TYPES[0]
 
 
-def random_delay() -> int:
-    """Случайная задержка между действиями (секунды)."""
-    r = random.random()
-    if r < 0.3:
-        return random.randint(30, 120)       # 30% — 30с–2мин
-    elif r < 0.6:
-        return random.randint(120, 300)      # 30% — 2–5мин
-    elif r < 0.85:
-        return random.randint(300, 600)      # 25% — 5–10мин
-    else:
-        return random.randint(600, 900)      # 15% — 10–15мин
+def get_current_session(hour: int) -> dict | None:
+    """Какая сессия сейчас — с учётом рандомного сдвига времени."""
+    for s in SESSIONS:
+        # Сдвигаем время сессии рандомно
+        shift_min = random.randint(s["shift_range"][0], s["shift_range"][1])
+        shifted_start = s["hour_start"] + shift_min / 60
+        shifted_end = s["hour_end"] + shift_min / 60
+
+        if shifted_start <= hour < shifted_end:
+            return s
+    return None
 
 
-# ── Действия ─────────────────────────────────────────────────
+def calc_session_actions(session: dict, day: int, mode: str) -> int:
+    """Сколько действий для этой сессии с учётом дня и режима."""
+    base = random.randint(session["actions_min"], session["actions_max"])
+    day_mult = DAY_MULTIPLIER.get(day, 1.0)
+    mode_mult = MODE_MULTIPLIER.get(mode, 1.0)
+    result = int(base * day_mult * mode_mult)
+    return max(result, 1)
+
+
+# ═══════════════════════════════════════════════════════════
+# ДЕЙСТВИЯ (Telegram)
+# ═══════════════════════════════════════════════════════════
 
 async def _do_read_feed(client, phone):
-    """Читает последние сообщения в случайном диалоге."""
     dialogs = await client.get_dialogs(limit=15)
     if not dialogs:
         return "Нет диалогов", ""
@@ -121,11 +229,10 @@ async def _do_read_feed(client, phone):
     for msg in messages:
         await client.send_read_acknowledge(dialog, msg)
         await asyncio.sleep(random.uniform(0.5, 2))
-    return f"Прочитал {len(messages)} сообщений", dialog.name or ""
+    return f"Прочитал {len(messages)} сообщений в «{dialog.name or '?'}»", dialog.name or ""
 
 
 async def _do_reaction(client, phone):
-    """Ставит случайную реакцию на пост в случайном канале."""
     from telethon.tl.functions.messages import SendReactionRequest
     from telethon.tl.types import ReactionEmoji
 
@@ -148,15 +255,14 @@ async def _do_reaction(client, phone):
             msg_id=msg.id,
             reaction=[ReactionEmoji(emoticon=emoji)],
         ))
-        return f"Поставил {emoji} на пост", ch.name or ""
+        return f"Поставил {emoji} в «{ch.name or '?'}»", ch.name or ""
     except Exception as e:
         if "REACTION_INVALID" in str(e):
-            return f"Реакции отключены", ch.name or ""
+            return "Реакции отключены", ch.name or ""
         raise
 
 
 async def _do_view_stories(client, phone):
-    """Просматривает Stories контактов."""
     try:
         from telethon.tl.functions.stories import GetAllStoriesRequest
         result = await client(GetAllStoriesRequest(next=False, hidden=False))
@@ -167,47 +273,39 @@ async def _do_view_stories(client, phone):
 
 
 async def _do_view_profile(client, phone):
-    """Открывает случайный профиль."""
     from telethon.tl.functions.users import GetFullUserRequest
     dialogs = await client.get_dialogs(limit=20)
     users = [d for d in dialogs if d.is_user and not d.entity.bot]
     if not users:
         return "Нет контактов", ""
-
     user = random.choice(users)
     try:
         await client(GetFullUserRequest(user.entity))
-        return f"Посмотрел профиль", user.name or ""
+        return f"Посмотрел профиль «{user.name or '?'}»", user.name or ""
     except:
         return "Профиль недоступен", ""
 
 
 async def _do_typing(client, phone):
-    """Имитация набора текста в Saved Messages."""
     from telethon.tl.functions.messages import SetTypingRequest
     from telethon.tl.types import SendMessageTypingAction
     me = await client.get_me()
-    await client(SetTypingRequest(
-        peer=me,
-        action=SendMessageTypingAction(),
-    ))
+    await client(SetTypingRequest(peer=me, action=SendMessageTypingAction()))
     await asyncio.sleep(random.uniform(2, 6))
     return "Печатал в Saved Messages", ""
 
 
 async def _do_search(client, phone):
-    """Поиск в Telegram."""
     from telethon.tl.functions.contacts import SearchRequest
     word = random.choice(SEARCH_WORDS)
     try:
         await client(SearchRequest(q=word, limit=5))
-        return f"Поискал: «{word}»", ""
+        return f"Поискал «{word}»", ""
     except:
-        return f"Поиск: «{word}» — ошибка", ""
+        return f"Поиск «{word}» — ошибка", ""
 
 
 async def _do_join_channel(client, phone):
-    """Вступает в случайный популярный канал."""
     from telethon.tl.functions.channels import JoinChannelRequest
     ch_name = random.choice(POPULAR_CHANNELS)
     try:
@@ -219,22 +317,73 @@ async def _do_join_channel(client, phone):
 
 
 async def _do_forward_saved(client, phone):
-    """Пересылает случайный пост в Saved Messages."""
     dialogs = await client.get_dialogs(limit=15)
     channels = [d for d in dialogs if d.is_channel]
     if not channels:
         return "Нет каналов", ""
-
     ch = random.choice(channels)
     messages = await client.get_messages(ch, limit=5)
     if not messages:
         return "Нет постов", ch.name or ""
-
     msg = random.choice(messages)
     me = await client.get_me()
     await client.forward_messages(me, msg)
-    return "Переслал пост в Saved", ch.name or ""
+    return f"Переслал пост из «{ch.name or '?'}» в Saved", ch.name or ""
 
+async def _do_send_saved(client, phone):
+    """Пишет случайное сообщение в Saved Messages."""
+    me = await client.get_me()
+    msg = random.choice(SAVED_MESSAGES)
+    await client.send_message(me, msg)
+    return f"Написал «{msg}» в Saved", ""
+
+
+async def _do_reply_dm(client, phone):
+    """Отвечает на последнее непрочитанное ЛС."""
+    dialogs = await client.get_dialogs(limit=20)
+    # Ищем непрочитанные ЛС (не боты, не каналы)
+    unread = [d for d in dialogs if d.is_user and not d.entity.bot and d.unread_count > 0]
+
+    if not unread:
+        # Нет непрочитанных — просто читаем случайный диалог
+        users = [d for d in dialogs if d.is_user and not d.entity.bot]
+        if not users:
+            return "Нет личных чатов", ""
+        d = random.choice(users)
+        msgs = await client.get_messages(d, limit=3)
+        for m in msgs:
+            await client.send_read_acknowledge(d, m)
+        return f"Прочитал ЛС от «{d.name or '?'}»", d.name or ""
+
+    # Есть непрочитанное — отвечаем
+    d = random.choice(unread)
+    reply = random.choice(REPLY_MESSAGES)
+
+    # Иногда (30%) отвечаем стикером вместо текста
+    if random.random() < 0.3:
+        try:
+            # Получаем стикерпак
+            from telethon.tl.functions.messages import GetAllStickersRequest
+            stickers = await client(GetAllStickersRequest(0))
+            if stickers.sets:
+                from telethon.tl.functions.messages import GetStickerSetRequest
+                from telethon.tl.types import InputStickerSetID
+                pack = random.choice(stickers.sets[:5])
+                sticker_set = await client(GetStickerSetRequest(
+                    stickerset=InputStickerSetID(id=pack.id, access_hash=pack.access_hash),
+                    hash=0
+                ))
+                if sticker_set.documents:
+                    sticker = random.choice(sticker_set.documents[:10])
+                    await client.send_file(d.entity, sticker)
+                    await client.send_read_acknowledge(d, await client.get_messages(d, limit=1))
+                    return f"Отправил стикер в ЛС «{d.name or '?'}»", d.name or ""
+        except:
+            pass  # Если стикеры не получилось — отвечаем текстом
+
+    await client.send_message(d.entity, reply)
+    await client.send_read_acknowledge(d, await client.get_messages(d, limit=1))
+    return f"Ответил «{reply}» в ЛС «{d.name or '?'}»", d.name or ""
 
 ACTION_FNS = {
     "read_feed":     _do_read_feed,
@@ -245,106 +394,125 @@ ACTION_FNS = {
     "search":        _do_search,
     "join_channel":  _do_join_channel,
     "forward_saved": _do_forward_saved,
+    "send_saved":    _do_send_saved,
+    "reply_dm":      _do_reply_dm,
 }
 
 
-# ── Обработка одного аккаунта ────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# ВЫПОЛНЕНИЕ СЕССИИ
+# ═══════════════════════════════════════════════════════════
 
-async def _warmup_single(task_row, account, proxy, db):
-    """Выполняет ОДНО действие прогрева для аккаунта."""
+async def _run_session(task_row, account, proxy, session_cfg, db):
+    """
+    Выполняет целую сессию — несколько действий подряд с короткими паузами.
+    Имитирует: человек достал телефон, полистал 5 минут, убрал.
+    """
     from utils.telegram import make_telethon_client
     from models.warmup_log import WarmupLog
 
     phone = account.phone
-    now = datetime.utcnow()
-    hour = now.hour
+    day = getattr(task_row, 'day', 1) or 1
+    mode = task_row.mode or "normal"
 
-    # Проверка: активные часы (8–23)
-    if hour < ACTIVE_HOURS[0] or hour >= ACTIVE_HOURS[1]:
-        return {"status": "sleeping", "phone": phone}
+    # Сколько действий в этой сессии
+    num_actions = calc_session_actions(session_cfg, day, mode)
 
-    # Проверка: день отдыха
-    if task_row.is_resting:
-        return {"status": "resting", "phone": phone}
+    logger.info(f"[warmup][{phone}] ═══ Начало сессии «{session_cfg['label']}» — {num_actions} действий (день {day}, {mode})")
 
-    # Проверка: ещё не время (offset не прошёл)
-    if task_row.next_action_at and now < task_row.next_action_at:
-        return {"status": "waiting", "phone": phone}
-
-    # Проверка: дневной лимит
-    if task_row.today_actions >= task_row.today_limit:
-        return {"status": "daily_limit", "phone": phone}
-
-    # Выбираем действие
-    action = pick_action()
-    action_fn = ACTION_FNS.get(action["name"])
-    if not action_fn:
-        return {"status": "no_action", "phone": phone}
+    # Логируем старт сессии
+    log = WarmupLog(
+        task_id=task_row.id, account_id=account.id,
+        action="session_start",
+        detail=f"Сессия «{session_cfg['label']}»: {num_actions} действий (день {day})",
+        success=True,
+    )
+    db.add(log)
 
     client = make_telethon_client(account, proxy)
     if not client:
-        log = WarmupLog(task_id=task_row.id, account_id=account.id, action="error",
-                        detail="Нет session файла", success=False)
+        log = WarmupLog(task_id=task_row.id, account_id=account.id,
+                        action="error", detail="Нет session файла", success=False)
         db.add(log)
-        return {"status": "no_session", "phone": phone}
+        return 0
+
+    done = 0
 
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            log = WarmupLog(task_id=task_row.id, account_id=account.id, action="error",
-                            detail="Не авторизован", success=False)
+            log = WarmupLog(task_id=task_row.id, account_id=account.id,
+                            action="error", detail="Не авторизован", success=False)
             db.add(log)
-            return {"status": "not_authorized", "phone": phone}
+            return 0
 
-        # Выполняем действие
-        detail, channel = await action_fn(client, phone)
+        for i in range(num_actions):
+            # Проверяем дневной лимит
+            if task_row.today_actions >= task_row.today_limit:
+                logger.info(f"[warmup][{phone}] Дневной лимит достигнут ({task_row.today_limit})")
+                break
 
-        # Определяем эмодзи для лога
-        emoji = ""
-        if action["name"] == "set_reaction" and "Поставил" in detail:
-            emoji = detail.split("Поставил ")[1].split(" ")[0] if "Поставил " in detail else ""
+            action = pick_action()
+            action_fn = ACTION_FNS.get(action["name"])
+            if not action_fn:
+                continue
 
-        # Логируем
-        log = WarmupLog(
-            task_id=task_row.id, account_id=account.id,
-            action=action["name"], detail=detail, emoji=emoji,
-            channel=channel, success=True,
-        )
-        db.add(log)
+            try:
+                detail, channel = await action_fn(client, phone)
 
-        # Обновляем счётчики
-        task_row.actions_done += 1
-        task_row.today_actions += 1
-        task_row.updated_at = now
+                emoji = ""
+                if action["name"] == "set_reaction" and "Поставил" in detail:
+                    parts = detail.split("Поставил ")
+                    if len(parts) > 1:
+                        emoji = parts[1].split(" ")[0]
 
-        # Обновляем специфические счётчики
-        if action["name"] == "read_feed":
-            task_row.feeds_read += 1
-        elif action["name"] == "set_reaction":
-            task_row.reactions_set += 1
-        elif action["name"] == "view_stories":
-            task_row.stories_viewed += 1
-        elif action["name"] == "join_channel":
-            task_row.channels_joined += 1
+                log = WarmupLog(
+                    task_id=task_row.id, account_id=account.id,
+                    action=action["name"], detail=detail, emoji=emoji,
+                    channel=channel, success=True,
+                    created_at=datetime.utcnow(),
+                )
+                db.add(log)
+                await db.flush()
+                await db.commit()
 
-        # Следующее действие через случайную паузу
-        delay = random_delay()
-        task_row.next_action_at = now + timedelta(seconds=delay)
+                # Обновляем счётчики
+                task_row.actions_done += 1
+                task_row.today_actions += 1
+                if action["name"] == "read_feed": task_row.feeds_read += 1
+                elif action["name"] == "set_reaction": task_row.reactions_set += 1
+                elif action["name"] == "view_stories": task_row.stories_viewed += 1
+                elif action["name"] == "join_channel": task_row.channels_joined += 1
 
-        logger.info(f"[warmup][{phone}] {action['label']}: {detail} (след. через {delay}с)")
+                done += 1
+                logger.info(f"[warmup][{phone}]   [{done}/{num_actions}] {action['label']}: {detail}")
 
-        return {"status": "ok", "phone": phone, "action": action["label"], "detail": detail, "next_delay": delay}
+            except Exception as e:
+                log = WarmupLog(
+                    task_id=task_row.id, account_id=account.id,
+                    action=action["name"], detail=str(e)[:200],
+                    success=False, error=str(e)[:200],
+                    created_at=datetime.utcnow(),
+                )
+                db.add(log)
+                await db.flush()
+                await db.commit()
+                logger.warning(f"[warmup][{phone}]   [{done}/{num_actions}] {action['label']}: ОШИБКА {str(e)[:80]}")
+
+            # Пауза между действиями внутри сессии (10-60с)
+            if i < num_actions - 1:
+                delay = random.randint(session_cfg["delay_min"], session_cfg["delay_max"])
+                logger.info(f"[warmup][{phone}]   ⏳ Пауза {delay}с...")
+                await asyncio.sleep(delay)
 
     except Exception as e:
         log = WarmupLog(
             task_id=task_row.id, account_id=account.id,
-            action=action["name"], detail=str(e)[:200],
+            action="error", detail=f"Ошибка сессии: {str(e)[:200]}",
             success=False, error=str(e)[:200],
         )
         db.add(log)
-        logger.error(f"[warmup][{phone}] Ошибка: {e}")
-        task_row.next_action_at = now + timedelta(seconds=300)
-        return {"status": "error", "phone": phone, "error": str(e)[:100]}
+        logger.error(f"[warmup][{phone}] Ошибка сессии: {e}")
 
     finally:
         try:
@@ -352,14 +520,35 @@ async def _warmup_single(task_row, account, proxy, db):
         except:
             pass
 
+    # Логируем конец сессии
+    log = WarmupLog(
+        task_id=task_row.id, account_id=account.id,
+        action="session_end",
+        detail=f"Сессия завершена: {done}/{num_actions} действий",
+        success=True,
+    )
+    db.add(log)
 
-# ── Обработка всех задач ─────────────────────────────────────
+    task_row.updated_at = datetime.utcnow()
+
+    logger.info(f"[warmup][{phone}] ═══ Сессия «{session_cfg['label']}» завершена: {done}/{num_actions}")
+
+    return done
+
+
+# ═══════════════════════════════════════════════════════════
+# ГЛАВНЫЙ ОБРАБОТЧИК
+# ═══════════════════════════════════════════════════════════
 
 async def _process_all_warmups_v2():
-    """Проверяет все активные прогревы и выполняет действия."""
-    if API_DIR not in sys.path:
-        sys.path.insert(0, API_DIR)
-
+    """
+    Вызывается каждые 60 секунд.
+    Для каждого аккаунта проверяет:
+      - Сейчас время сессии?
+      - Сессия уже была сегодня?
+      - Если да — запускает сессию (несколько действий подряд)
+      - Если нет — пропускает (waiting)
+    """
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
@@ -367,6 +556,7 @@ async def _process_all_warmups_v2():
     from models.warmup import WarmupTask
     from models.account import TelegramAccount
     from models.proxy import Proxy
+    from models.warmup_log import WarmupLog
 
     engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
     Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
@@ -383,40 +573,123 @@ async def _process_all_warmups_v2():
                 return {"processed": 0}
 
             now = datetime.utcnow()
+            hour = (now.hour + 3) % 24  
             processed = 0
             results = []
 
             for t in tasks:
+                phone_tag = f"task#{t.id}"
+
                 # ── Управление днями ─────────────────────
-                # Новый день?
                 if t.day_started_at:
                     hours_since = (now - t.day_started_at).total_seconds() / 3600
                     if hours_since >= 24:
-                        t.day += 1
+                        t.day = (t.day or 1) + 1
                         t.day_started_at = now
                         t.today_actions = 0
-                        min_a, max_a = get_day_limit(t.day)
-                        t.today_limit = random.randint(min_a, max_a)
-                        t.is_resting = random.random() < REST_CHANCE
 
-                        if t.is_resting:
-                            logger.info(f"[warmup] Task #{t.id}: День {t.day} — ОТДЫХ 😴")
+                        # Выбираем ТИП дня
+                        day_type = pick_day_type()
+
+                        if day_type["name"] == "rest":
+                            t.is_resting = True
+                            t.today_limit = 0
+                            logger.info(f"[warmup][{phone_tag}] День {t.day} — 😴 ПОЛНЫЙ ОТДЫХ")
+                            log = WarmupLog(task_id=t.id, account_id=t.account_id,
+                                            action="rest_day", detail=f"День {t.day} — {day_type['label']}", success=True)
+                            db.add(log)
                         else:
-                            logger.info(f"[warmup] Task #{t.id}: День {t.day} — лимит {t.today_limit} действий")
+                            t.is_resting = False
+                            day_mult = DAY_MULTIPLIER.get(t.day, 1.0)
+                            mode_mult = MODE_MULTIPLIER.get(t.mode, 1.0)
+                            base_limit = random.randint(25, 50)
+                            t.today_limit = int(base_limit * day_mult * mode_mult * day_type["session_mult"])
+                            t.today_limit = max(t.today_limit, 3)  # минимум 3 действия
 
-                        # Завершение после total_days
-                        if t.day > (t.total_days or 7):
+                            logger.info(f"[warmup][{phone_tag}] День {t.day} — {day_type['label']} — лимит {t.today_limit}")
+                            log = WarmupLog(task_id=t.id, account_id=t.account_id,
+                                            action="new_day",
+                                            detail=f"День {t.day}: {day_type['label']}, лимит {t.today_limit}",
+                                            success=True)
+                            db.add(log)
+
+                        # Завершение
+                        total_days = getattr(t, 'total_days', 7) or 7
+                        if t.day > total_days:
                             t.status = "finished"
                             t.finished_at = now
-                            logger.info(f"[warmup] Task #{t.id}: Прогрев завершён ({t.total_days} дней)")
+                            log = WarmupLog(task_id=t.id, account_id=t.account_id,
+                                            action="finished", detail=f"Прогрев завершён ({total_days} дней)", success=True)
+                            db.add(log)
+                            logger.info(f"[warmup][{phone_tag}] ✅ Прогрев завершён")
                             continue
                 else:
-                    # Первый запуск
                     t.day_started_at = now
                     t.day = 1
-                    min_a, max_a = get_day_limit(1)
-                    t.today_limit = random.randint(min_a, max_a)
+                    day_type = pick_day_type()
+                    # Первый день не может быть отдыхом
+                    while day_type["name"] == "rest":
+                        day_type = pick_day_type()
+                    day_mult = DAY_MULTIPLIER.get(1, 0.4)
+                    mode_mult = MODE_MULTIPLIER.get(t.mode, 1.0)
+                    t.today_limit = int(random.randint(25, 50) * day_mult * mode_mult * day_type["session_mult"])
+                    t.today_limit = max(t.today_limit, 3)
+                    t.today_actions = 0
                     t.is_resting = False
+                    log = WarmupLog(task_id=t.id, account_id=t.account_id,
+                                    action="new_day",
+                                    detail=f"День 1: {day_type['label']}, лимит {t.today_limit}",
+                                    success=True)
+                    db.add(log)
+
+                # День отдыха — пропускаем
+                if t.is_resting:
+                    results.append({"status": "resting", "task_id": t.id})
+                    continue
+
+                # Ночь — спим
+                if hour < 8 or hour >= 24:
+                    results.append({"status": "sleeping", "task_id": t.id})
+                    continue
+
+                # Дневной лимит достигнут
+                if t.today_actions >= (t.today_limit or 999):
+                    results.append({"status": "daily_limit", "task_id": t.id})
+                    continue
+
+                # ── Ещё не время? (offset при старте) ────
+                if t.next_action_at and now < t.next_action_at:
+                    results.append({"status": "waiting", "task_id": t.id})
+                    continue
+
+                # ── Определяем текущую сессию ────────────
+                session_cfg = get_current_session(hour)
+                if not session_cfg:
+                    results.append({"status": "no_session", "task_id": t.id})
+                    continue
+
+                # Шанс что сессия вообще будет
+                if random.random() > session_cfg["chance"]:
+                    # Пропускаем сессию — следующая проверка через 30-60 мин
+                    t.next_action_at = now + timedelta(minutes=random.randint(30, 60))
+                    results.append({"status": "skipped_session", "task_id": t.id})
+                    logger.info(f"[warmup][{phone_tag}] Сессия «{session_cfg['label']}» пропущена (рандом)")
+                    continue
+
+                # Проверяем не было ли уже этой сессии сегодня
+                existing_log = await db.execute(
+                    select(WarmupLog).where(
+                        WarmupLog.task_id == t.id,
+                        WarmupLog.action == "session_start",
+                        WarmupLog.detail.contains(session_cfg["label"]),
+                        WarmupLog.created_at >= t.day_started_at,
+                    ).limit(1)
+                )
+                if existing_log.scalar_one_or_none():
+                    # Эта сессия уже была сегодня — ждём следующую
+                    t.next_action_at = now + timedelta(minutes=random.randint(20, 40))
+                    results.append({"status": "session_done_today", "task_id": t.id})
+                    continue
 
                 # ── Загружаем аккаунт ────────────────────
                 acc_r = await db.execute(
@@ -426,6 +699,7 @@ async def _process_all_warmups_v2():
                 )
                 acc = acc_r.scalar_one_or_none()
                 if not acc or acc.status not in ("active", "unknown"):
+                    results.append({"status": "inactive", "task_id": t.id})
                     continue
 
                 proxy = None
@@ -433,8 +707,20 @@ async def _process_all_warmups_v2():
                     proxy_r = await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))
                     proxy = proxy_r.scalar_one_or_none()
 
-                res = await _warmup_single(t, acc, proxy, db)
-                results.append(res)
+                # ── ЗАПУСКАЕМ СЕССИЮ ─────────────────────
+                done = await _run_session(t, acc, proxy, session_cfg, db)
+
+                # После сессии — тишина до следующей (1-3 часа)
+                silence = random.randint(60, 180)
+                t.next_action_at = now + timedelta(minutes=silence)
+
+                results.append({
+                    "status": "session_done",
+                    "task_id": t.id,
+                    "session": session_cfg["label"],
+                    "actions": done,
+                    "next_in_min": silence,
+                })
                 processed += 1
 
             await db.commit()
@@ -450,6 +736,6 @@ async def _process_all_warmups_v2():
 
 @celery_app.task(bind=True, name="tasks.warmup_v2.process_warmups_v2")
 def process_warmups_v2(self):
-    """Запускается каждые 60 секунд Celery Beat."""
+    """Вызывается каждые 60 секунд из run_periodic.py."""
     self.update_state(state="PROGRESS", meta={"message": "Прогрев v2..."})
     return run_async(_process_all_warmups_v2())

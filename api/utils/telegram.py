@@ -52,6 +52,36 @@ def _build_proxy(proxy_row):
     logger.info(f"✅ Прокси: {proto_str}://{host}:{port}")
     return proxy
 
+DEVICE_PROFILES = [
+    {"device": "Desktop", "system": "Windows 10", "app_version": "4.14.15", "lang": "ru"},
+    {"device": "Desktop", "system": "Windows 11", "app_version": "4.16.8", "lang": "ru"},
+    {"device": "Desktop", "system": "macOS 14.2", "app_version": "10.6.2", "lang": "ru"},
+    {"device": "Desktop", "system": "Ubuntu 22.04", "app_version": "4.15.2", "lang": "ru"},
+    {"device": "iPhone 14 Pro", "system": "iOS 17.4", "app_version": "10.8.3", "lang": "ru"},
+    {"device": "iPhone 13", "system": "iOS 17.2", "app_version": "10.7.1", "lang": "ru"},
+    {"device": "iPhone 15", "system": "iOS 17.5", "app_version": "10.9.1", "lang": "ru"},
+    {"device": "Samsung Galaxy S23", "system": "Android 14", "app_version": "10.12.0", "lang": "ru"},
+    {"device": "Samsung Galaxy A54", "system": "Android 14", "app_version": "10.11.2", "lang": "ru"},
+    {"device": "Xiaomi 13", "system": "Android 13", "app_version": "10.10.1", "lang": "ru"},
+    {"device": "Google Pixel 8", "system": "Android 14", "app_version": "10.12.0", "lang": "en"},
+    {"device": "OnePlus 11", "system": "Android 14", "app_version": "10.11.0", "lang": "ru"},
+    {"device": "iPad Pro", "system": "iOS 17.4", "app_version": "10.8.3", "lang": "ru"},
+    {"device": "Huawei P60", "system": "Android 13", "app_version": "10.9.2", "lang": "ru"},
+]
+
+
+def _get_device_fingerprint(phone: str) -> dict:
+    """
+    Возвращает ВСЕГДА один и тот же профиль для одного номера.
+    Используем hash чтобы не хранить в БД.
+    Важно: менять device после авторизации НЕЛЬЗЯ — Telegram убьёт сессии.
+    """
+    if not phone:
+        return DEVICE_PROFILES[0]
+    # Детерминированный выбор по хешу номера
+    h = sum(ord(c) for c in phone)
+    return DEVICE_PROFILES[h % len(DEVICE_PROFILES)]
+
 
 def make_telethon_client(account, proxy_row=None, api_id_override=None, api_hash_override=None):
     """
@@ -85,11 +115,22 @@ def make_telethon_client(account, proxy_row=None, api_id_override=None, api_hash
     if not tg_proxy:
         logger.warning(f"⛔ Аккаунт {session_path} — нет прокси, подключение отменено")
         return None
+    phone = ""
+    if hasattr(account, 'phone'):
+        phone = account.phone
+    elif isinstance(account, dict):
+        phone = account.get('phone', '')
+    
+    fingerprint = _get_device_fingerprint(phone)
+
     return TelegramClient(
         session_path, used_api_id, used_api_hash,
         proxy=tg_proxy,
-        device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
-        lang_code="ru", system_lang_code="ru",
+        device_model=fingerprint["device"],
+        system_version=fingerprint["system"],
+        app_version=fingerprint["app_version"],
+        lang_code=fingerprint["lang"],
+        system_lang_code=fingerprint["lang"],
         timeout=30,
     )
 
