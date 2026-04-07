@@ -13,13 +13,17 @@ import importlib.util
 from datetime import datetime
 from dotenv import load_dotenv
 
+
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
-from celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if API_DIR not in sys.path: sys.path.insert(0, API_DIR)
+_root = os.path.dirname(API_DIR)
+while _root in sys.path: sys.path.remove(_root)
+if 'config' in sys.modules and 'api' not in getattr(sys.modules['config'], '__file__', ''): del sys.modules['config']
+from celery_app import celery_app
 
 MODE_LIMITS = {
     "careful":    {"actions_per_hour": 5,  "delay_min": 30, "delay_max": 120},

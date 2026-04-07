@@ -10,13 +10,17 @@ import os
 import logging
 import time
 
-from celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+# Гарантируем что api/ первый, корень — убран
+if API_DIR not in sys.path: sys.path.insert(0, API_DIR)
+_root = os.path.dirname(API_DIR)
+while _root in sys.path: sys.path.remove(_root)
+if 'config' in sys.modules and 'api' not in getattr(sys.modules['config'], '__file__', ''): del sys.modules['config']
 
+from celery_app import celery_app
 
 def run_async(coro):
     loop = asyncio.new_event_loop()
